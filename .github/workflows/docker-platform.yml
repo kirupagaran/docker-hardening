@@ -1,0 +1,402 @@
+# =============================================================
+# .github/workflows/docker-platform.yml
+#
+# Builds a separate hardened Docker image per workload team.
+#
+# ┌─────────────────────────────────────────────────────────┐
+# │  PR flow                                                │
+# │  1. validate-layers  — Lints all changed Dockerfile     │
+# │                        .layer files for violations.     │
+# │  2. discover-teams   — Finds which teams are affected.  │
+# │  3. build-pr         — Matrix smoke-build, one job per  │
+# │                        affected team (no push).         │
+# └─────────────────────────────────────────────────────────┘
+# ┌─────────────────────────────────────────────────────────┐
+# │  Merge flow (push to main)                              │
+# │  1. discover-teams   — Finds ALL teams with a layer.    │
+# │  2. build-harden     — Matrix build, one job per team.  │
+# │                        Each job:                        │
+# │                          • Validates the layer          │
+# │                          • Hardens the Dockerfile       │
+# │                          • Builds & pushes the image    │
+# │                          • Scans with Trivy             │
+# │                          • Verifies sudo is disabled    │
+# └─────────────────────────────────────────────────────────┘
+#
+# Images are published as:
+#   ghcr.io/<org>/<repo>/<team-name>:latest
+#   ghcr.io/<org>/<repo>/<team-name>:sha-<commit>
+#   ghcr.io/<org>/<repo>/<team-name>:<YYYY-MM-DD>
+# =============================================================
+
+name: Platform Docker Build
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - "Dockerfile"
+      - "workloads/**"
+      - "security/**"
+      - ".github/workflows/docker-platform.yml"
+
+  push:
+    branches: [main]
+    paths:
+      - "Dockerfile"
+      - "workloads/**"
+      - "security/**"
+      - ".github/workflows/docker-platform.yml"
+
+env:
+  REGISTRY: ghcr.io
+
+concurrency:
+  group: docker-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+
+  # ─────────────────────────────────────────────────────────────
+  # JOB 1: Validate changed layers (PR only)
+  # Runs once — catches violations before any build starts.
+  # ─────────────────────────────────────────────────────────────
+  validate-layers:
+    name: Validate Workload Layers
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write
+      contents: read
+
+    steps:
+      - name: Checkout PR branch
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Detect changed Dockerfile.layer files
+        id: changed
+        run: |
+          git diff --name-only origin/main...HEAD \
+            | grep '^workloads/.*/Dockerfile\.layer$' \
+            > /tmp/changed_layers.txt || true
+
+          echo "--- Changed layers ---"
+          cat /tmp/changed_layers.txt || echo "(none)"
+
+          # Warn if platform-owned files were also touched
+          git diff --name-only origin/main...HEAD \
+            | grep -vE '^workloads/' \
+            | grep -vE '^\.github/' \
+            > /tmp/platform_changes.txt || true
+
+          if [ -s /tmp/platform_changes.txt ]; then
+            echo "::warning::Platform-owned files changed — platform team review required:"
+            cat /tmp/platform_changes.txt
+          fi
+
+          if [ -s /tmp/changed_layers.txt ]; then
+            echo "layers_changed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "layers_changed=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Enforce one-team-per-PR rule
+        if: steps.changed.outputs.layers_changed == 'true'
+        run: |
+          TEAMS=$(grep -oP 'workloads/\K[^/]+' /tmp/changed_layers.txt | sort -u)
+          TEAM_COUNT=$(echo "$TEAMS" | grep -c .)
+
+          echo "Teams in this PR: $TEAMS"
+
+          if [ "$TEAM_COUNT" -gt 1 ]; then
+            echo "❌ This PR touches layers for $TEAM_COUNT teams: $TEAMS"
+            echo "Please open one PR per workload team."
+            exit 1
+          fi
+
+          echo "✅ Single-team PR: $TEAMS"
+
+      - name: Set up Python
+        if: steps.changed.outputs.layers_changed == 'true'
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Run layer policy validator
+        id: validate
+        if: steps.changed.outputs.layers_changed == 'true'
+        run: |
+          EXIT_CODE=0
+          while IFS= read -r layer; do
+            echo "=== Validating: $layer ==="
+            python3 security/validate_layer.py "$layer" || EXIT_CODE=$?
+          done < /tmp/changed_layers.txt
+          exit $EXIT_CODE
+
+      - name: Lint with hadolint
+        if: steps.changed.outputs.layers_changed == 'true'
+        run: |
+          wget -qO /usr/local/bin/hadolint \
+            https://github.com/hadolint/hadolint/releases/latest/download/hadolint-Linux-x86_64
+          chmod +x /usr/local/bin/hadolint
+
+          EXIT_CODE=0
+          while IFS= read -r layer; do
+            echo "=== Linting: $layer ==="
+            hadolint --failure-threshold error \
+                     --ignore DL3008 --ignore DL3009 \
+                     "$layer" || EXIT_CODE=$?
+          done < /tmp/changed_layers.txt
+          exit $EXIT_CODE
+
+      - name: Post PR comment
+        if: always()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const validate = '${{ steps.validate.outcome }}';
+            const changed  = '${{ steps.changed.outputs.layers_changed }}';
+
+            let body;
+            if (changed !== 'true') {
+              body = '> ℹ️ No `Dockerfile.layer` changes detected in this PR.';
+            } else if (validate === 'success') {
+              body = [
+                '✅ **Workload layer validation passed.**',
+                '',
+                'Your `Dockerfile.layer` is valid. On merge, a dedicated hardened image will be built and pushed to:',
+                '```',
+                `ghcr.io/${{ github.repository }}/<your-team>:latest`,
+                '```',
+              ].join('\n');
+            } else {
+              body = [
+                '❌ **Workload layer validation failed.**',
+                '',
+                'Fix the violations listed in the Actions log before merging. Common causes:',
+                '- Forbidden instructions (`FROM`, `USER`, `ENTRYPOINT`, `CMD`, `EXPOSE`)',
+                '- Installing `sudo`',
+                '- `pip install` missing `--no-cache-dir`',
+                '- `apt-get install` without `rm -rf /var/lib/apt/lists/*`',
+              ].join('\n');
+            }
+
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner:        context.repo.owner,
+              repo:         context.repo.repo,
+              body,
+            });
+
+  # ─────────────────────────────────────────────────────────────
+  # JOB 2: Discover which teams to build
+  # On PR  → only the teams whose layers changed
+  # On push → every team that has a Dockerfile.layer
+  # Outputs a JSON array consumed by the matrix jobs below.
+  # ─────────────────────────────────────────────────────────────
+  discover-teams:
+    name: Discover Teams
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      teams: ${{ steps.discover.outputs.teams }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Build team matrix
+        id: discover
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            # PR: only teams whose layer changed
+            TEAMS_JSON=$(
+              git diff --name-only origin/main...HEAD \
+                | grep '^workloads/.*/Dockerfile\.layer$' \
+                | grep -oP 'workloads/\K[^/]+' \
+                | sort -u \
+                | jq -R . | jq -sc .
+            )
+          else
+            # Merge: every team that has a Dockerfile.layer
+            TEAMS_JSON=$(
+              find workloads -name "Dockerfile.layer" \
+                | grep -oP 'workloads/\K[^/]+' \
+                | sort -u \
+                | jq -R . | jq -sc .
+            )
+          fi
+
+          # Fall back to empty array if nothing found
+          if [ -z "$TEAMS_JSON" ] || [ "$TEAMS_JSON" = "null" ]; then
+            TEAMS_JSON="[]"
+          fi
+
+          echo "teams=$TEAMS_JSON" >> "$GITHUB_OUTPUT"
+          echo "Discovered teams: $TEAMS_JSON"
+
+  # ─────────────────────────────────────────────────────────────
+  # JOB 3: Smoke-build per team (PR only)
+  # Runs in parallel — one runner per team.
+  # ─────────────────────────────────────────────────────────────
+  build-pr:
+    name: "Smoke Build — ${{ matrix.team }}"
+    if: github.event_name == 'pull_request' && needs.discover-teams.outputs.teams != '[]'
+    needs: [validate-layers, discover-teams]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    strategy:
+      fail-fast: false          # let all teams report independently
+      matrix:
+        team: ${{ fromJson(needs.discover-teams.outputs.teams) }}
+
+    steps:
+      - name: Checkout PR branch
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build hardened Dockerfile for ${{ matrix.team }}
+        run: |
+          chmod +x security/harden.sh
+          bash security/harden.sh "${{ matrix.team }}" workloads/ build/
+
+      - name: Smoke-build image (no push)
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: build/${{ matrix.team }}/Dockerfile.hardened
+          push: false
+          tags: pr-smoke/${{ matrix.team }}:${{ github.event.pull_request.number }}
+
+  # ─────────────────────────────────────────────────────────────
+  # JOB 4: Harden, build, scan, push per team (merge to main)
+  # Runs in parallel — one runner per team.
+  # Each team's image is fully independent.
+  # ─────────────────────────────────────────────────────────────
+  build-harden:
+    name: "Build & Push — ${{ matrix.team }}"
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && needs.discover-teams.outputs.teams != '[]'
+    needs: [discover-teams]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+      security-events: write
+
+    strategy:
+      fail-fast: false          # one team's failure doesn't block others
+      matrix:
+        team: ${{ fromJson(needs.discover-teams.outputs.teams) }}
+
+    steps:
+      - name: Checkout main
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Validate layer for ${{ matrix.team }}
+        run: |
+          python3 security/validate_layer.py \
+            workloads/${{ matrix.team }}/Dockerfile.layer
+
+      - name: Build hardened Dockerfile for ${{ matrix.team }}
+        run: |
+          chmod +x security/harden.sh
+          bash security/harden.sh "${{ matrix.team }}" workloads/ build/
+
+      - name: Docker metadata for ${{ matrix.team }}
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          # Each team gets its own image path in GHCR
+          images: ${{ env.REGISTRY }}/${{ github.repository }}/${{ matrix.team }}
+          tags: |
+            type=sha,prefix=sha-
+            type=raw,value=latest
+            type=raw,value={{date 'YYYY-MM-DD'}}
+
+      - name: Build and push ${{ matrix.team }} image
+        id: build
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: build/${{ matrix.team }}/Dockerfile.hardened
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          # Team-scoped cache key so teams don't share/invalidate each other
+          cache-from: type=gha,scope=${{ matrix.team }}
+          cache-to: type=gha,scope=${{ matrix.team }},mode=max
+          provenance: true
+          sbom: true
+
+      - name: Scan ${{ matrix.team }} image (Trivy)
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ env.REGISTRY }}/${{ github.repository }}/${{ matrix.team }}:latest
+          format: sarif
+          output: trivy-${{ matrix.team }}.sarif
+          severity: HIGH,CRITICAL
+          exit-code: "1"
+
+      - name: Upload Trivy SARIF — ${{ matrix.team }}
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy-${{ matrix.team }}.sarif
+          # Each team's results appear under their own category in the Security tab
+          category: ${{ matrix.team }}
+
+      - name: Verify sudo is disabled in ${{ matrix.team }} image
+        run: |
+          docker run --rm --user 10001 \
+            ${{ env.REGISTRY }}/${{ github.repository }}/${{ matrix.team }}:latest \
+            /bin/sh -c "sudo echo FAIL 2>&1; exit 0" \
+            | grep -qv "FAIL" \
+            && echo "✅ sudo correctly disabled" \
+            || (echo "❌ sudo still functional!" && exit 1)
+
+      - name: Write job summary — ${{ matrix.team }}
+        run: |
+          cat >> $GITHUB_STEP_SUMMARY << SUMMARY
+          ## 🔒 ${{ matrix.team }} — Hardened Image Published
+
+          | Property | Value |
+          |---|---|
+          | **Image** | \`${{ env.REGISTRY }}/${{ github.repository }}/${{ matrix.team }}\` |
+          | **Digest** | \`${{ steps.build.outputs.digest }}\` |
+          | **Tags** | \`latest\`, \`sha-${{ github.sha }}\`, \`$(date +%Y-%m-%d)\` |
+          | **Commit** | \`${{ github.sha }}\` |
+          | **Triggered by** | @${{ github.actor }} |
+
+          ### Security Hardening Applied
+          - ✅ \`sudo\` removed / disabled
+          - ✅ \`su\` restricted to root group
+          - ✅ Sensitive binaries restricted (curl, wget, nc)
+          - ✅ Non-root runtime user \`appuser (uid=10001)\`
+          - ✅ IPTables entrypoint injected (default-DROP, HTTPS+DNS only)
+          - ✅ Trivy vulnerability scan passed
+          - ✅ SBOM + provenance attestations attached
+          SUMMARY

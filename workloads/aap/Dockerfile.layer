@@ -1,0 +1,17 @@
+# ============================================================
+# Workload Layer: payments-team
+# Owner: @payments-team
+#
+# Rules:
+#   - Only RUN, COPY, ENV, ARG, and WORKDIR are permitted.
+#   - Do NOT use: FROM, USER, ENTRYPOINT, CMD, EXPOSE
+#   - Do NOT install or enable sudo.
+#   - All packages must be pinned to a specific version.
+#   - Keep apt cache cleaned in the same RUN step.
+# ============================================================
+
+RUN pip install --no-cache-dir \
+    requests==2.31.0 \
+    stripe==7.10.0
+
+ENV PAYMENTS_ENV=production
